@@ -35,7 +35,7 @@ uint32_t StackPush(EmitterState& s, const MemoryResourceAccess& memory,
 	const auto index = StackIndex(s, control, ring);
 	EmitIfCondition(s, EmitMemoryElementInBounds(s, memory, index), [&] {
 		s.builder.AddFunction(spv::OpStore, EmitMemoryElementPointer(s, memory, index), node);
-	});
+	}, "Trinity:MemoryBounds");
 	control = Binary(s, spv::OpBitwiseOr, u, control,
 	    Select(s, u, Binary(s, spv::OpIEqual, b, count, capacity), ConstantU32(s, 1u << 30), zero));
 	control = Select(s, u, Binary(s, spv::OpIEqual, b, parent, capacity),

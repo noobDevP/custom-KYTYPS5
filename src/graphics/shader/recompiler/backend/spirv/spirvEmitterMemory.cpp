@@ -277,7 +277,7 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t value, bool
 		                          spv::MemoryAccessAlignedMask |
 		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
 		                          alignment);
-	});
+	}, "Memory:StoreBdaPresent");
 }
 
 void StoreBda(ValueEmitContext& ctx, uint32_t address, uint32_t data, uint32_t active, uint32_t bits,
@@ -304,7 +304,7 @@ void StoreBda(ValueEmitContext& ctx, uint32_t address, uint32_t data, uint32_t a
 		                            Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 		                                   Binary(state, spv::OpBitwiseAnd, TypeU32(state), data, mask), shift));
 		StoreBdaDword(ctx, aligned, new_val, coherent);
-	});
+	}, "Memory:StoreBdaActiveLane");
 }
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -402,12 +402,13 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 			    if (!empty_root) return selected_access();
 			    return EmitValueOrDefaultIfCondition(state,
 			        Binary(state, spv::OpINotEqual, TypeBool(state), selected, ConstantU32(state, 0u)),
-			        TypeU32Composite(state, components), access(root_resource), selected_access);
-		    });
+			        TypeU32Composite(state, components), access(root_resource), selected_access,
+			        "Memory:BufferDescriptorSelect");
+		    }, "Memory:BufferDescriptorSelect");
 	} else {
 		if (empty_root) valid = AndCondition(state, valid,
 		    Binary(state, spv::OpINotEqual, TypeBool(state), selected, ConstantU32(state, 0u)));
-		EmitIfCondition(state, valid, selected_access);
+		EmitIfCondition(state, valid, selected_access, "Memory:BufferDescriptorSelect");
 	}
 }
 
@@ -626,7 +627,7 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	                           : EmitMemoryElementInBounds(ctx.state, resource, index);
 	EmitIfCondition(ctx.state, BufferIndexInBounds(ctx, inst, mem, resource, in_bounds), [&]() {
 		StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
-	});
+	}, "Memory:BufferBounds");
 }
 
 void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits) {
@@ -634,7 +635,7 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 		EmitBufferAccess(ctx, inst, mem, 0u, [&](const auto& selected, const auto& resource) {
 			StoreSubwordPrepared(ctx, inst, selected, resource, bits, ctx.Arg(inst, inst.NumArgs() - 2));
 		});
-	});
+	}, "Memory:StoreSubwordActiveLane");
 }
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
@@ -683,9 +684,9 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ForEachLocalFlatAccess(ctx, inst, [&](const auto& resource, uint32_t index, uint32_t valid) {
 			EmitIfCondition(ctx.state, valid, [&]() {
 				StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, inst.NumArgs() - 2));
-			});
+			}, "Memory:StoreLocalFlatValid");
 		});
-	});
+	}, "Memory:StoreLocalFlatActiveLane");
 }
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -696,7 +697,7 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	    EmitStorageElementInBounds(ctx.state, resource, index));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
-	});
+	}, "Memory:StoreWordBounds");
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -704,7 +705,7 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 		EmitBufferAccess(ctx, inst, mem, 0u, [&](const auto& selected, const auto& resource) {
 			StoreWordPrepared(ctx, inst, selected, resource, ctx.Arg(inst, inst.NumArgs() - 2));
 		});
-	});
+	}, "Memory:StoreWordActiveLane");
 }
 
 template <typename Fn>
@@ -925,7 +926,7 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 			StoreWordInBounds(ctx, plan.resource,
 			                  FormattedComponentAddress(ctx.state, plan, 0u).second, packed);
 		}
-	});
+	}, "Memory:StoreFormattedBounds");
 }
 
 uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {

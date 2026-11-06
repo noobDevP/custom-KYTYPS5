@@ -12826,13 +12826,111 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckSha256KnownAnswers() {
+    constexpr const char* name = "Sha256KnownAnswerTests";
+    std::printf("Running %s...\n", name);
+
+    // 1. Empty string
+    {
+      const std::string input = "";
+      const std::string expected = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+      const std::string actual = Common::Sha256::ComputeHex(
+          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input.data()), input.size()));
+      Require(name, "empty input", actual == expected,
+              fmt::format("empty input mismatch: got {} expected {}", actual, expected).c_str());
+    }
+
+    // 2. ASCII "abc"
+    {
+      const std::string input = "abc";
+      const std::string expected = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+      const std::string actual = Common::Sha256::ComputeHex(
+          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input.data()), input.size()));
+      Require(name, "ASCII 'abc'", actual == expected,
+              fmt::format("ASCII 'abc' mismatch: got {} expected {}", actual, expected).c_str());
+    }
+
+    // 3. Multi-block input (NIST Vector 3, 56 bytes)
+    {
+      const std::string input = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+      const std::string expected = "248D6A61D20638B8E5C026930C3E6039A33CE45964FF2167F6ECEDD419DB06C1";
+      const std::string actual = Common::Sha256::ComputeHex(
+          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input.data()), input.size()));
+      Require(name, "56-byte input", actual == expected,
+              fmt::format("56-byte input mismatch: got {} expected {}", actual, expected).c_str());
+    }
+
+    // 4. Multi-block input (NIST Vector 4, 112 bytes)
+    const std::string input112 =
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    const std::string expected112 = "CF5B16A778AF8380036CE59E7B0492370B249B11E8F07A51AFAC45037AFEE9D1";
+    {
+      const std::string actual = Common::Sha256::ComputeHex(
+          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input112.data()), input112.size()));
+      Require(name, "112-byte contiguous input", actual == expected112,
+              fmt::format("112-byte mismatch: got {} expected {}", actual, expected112).c_str());
+    }
+
+    // 5. The same input supplied through differently sized Update calls
+    const std::vector<size_t> chunk_sizes = {1, 2, 3, 7, 16, 23, 32, 56, 64, 71, 100, 112};
+    for (size_t chunk_size : chunk_sizes) {
+      Common::Sha256 hasher;
+      for (size_t offset = 0; offset < input112.size(); offset += chunk_size) {
+        const size_t len = std::min(chunk_size, input112.size() - offset);
+        hasher.Update(input112.data() + offset, len);
+      }
+      const std::string actual = Common::Sha256::DigestToHex(hasher.Finalize());
+      Require(name, fmt::format("chunk_size_{}", chunk_size).c_str(), actual == expected112,
+              fmt::format("chunk size {} mismatch: got {} expected {}", chunk_size, actual, expected112).c_str());
+    }
+
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckInstrumentationParity() {
+    constexpr const char* name = "InstrumentationParity";
+    std::printf("Running %s...\n", name);
+
+    const std::vector<uint32_t> test_code = {
+        EncodeSMovB32(20, InlineU32(42)),
+        0xbf810000u
+    };
+    ShaderComputeInputInfo compute_info{};
+    ShaderRecompiler::CompileOptions opt1{};
+    opt1.stage = ShaderType::Compute;
+    opt1.shader_hash = 0x12345678ull;
+    opt1.input_info.compute = &compute_info;
+    auto trans1 = ShaderRecompiler::TranslateProgram(test_code, opt1);
+    const auto comp1 = ShaderRecompiler::CompileProgram(std::move(trans1), opt1, {});
+
+    ShaderRecompiler::CompileOptions opt2{};
+    opt2.stage = ShaderType::Compute;
+    opt2.shader_hash = 0x1a04c58a9fbc2052ull;
+    opt2.input_info.compute = &compute_info;
+    auto trans2 = ShaderRecompiler::TranslateProgram(test_code, opt2);
+    const auto comp2 = ShaderRecompiler::CompileProgram(std::move(trans2), opt2, {});
+
+    Require(name, "translation results valid", !comp1.spirv.empty() && !comp2.spirv.empty(),
+            "compilation produced empty SPIR-V");
+    Require(name, "instrumentation disabled vs enabled byte parity", comp1.spirv == comp2.spirv,
+            fmt::format("instrumentation produced divergent SPIR-V (size {} vs {})",
+                        comp1.spirv.size(), comp2.spirv.size()).c_str());
+
+    std::printf("[host]    %-32s ok (spirv words: %zu)\n", name, comp1.spirv.size());
+  }
+
   void CheckWolverinePipelineRepro(
       const std::filesystem::path& spv_path,
       const std::filesystem::path& meta_path,
       const char* mode_str,
       const std::filesystem::path& cache_path) {
 
-    const bool disable_opt = (mode_str && std::strcmp(mode_str, "disable_opt") == 0);
+    if (mode_str == nullptr || (std::strcmp(mode_str, "normal") != 0 && std::strcmp(mode_str, "disable_opt") != 0)) {
+      std::fprintf(stderr, "FATAL ERROR: Unknown replay mode '%s' (expected 'normal' or 'disable_opt')\n",
+                   mode_str ? mode_str : "<null>");
+      std::exit(1);
+    }
+    const bool disable_opt = (std::strcmp(mode_str, "disable_opt") == 0);
     std::printf("================================================================\n");
     std::printf("Wolverine Pipeline Creation Repro\n");
     std::printf("  SPIR-V:   %s\n", spv_path.string().c_str());
@@ -12884,28 +12982,6 @@ public:
     std::printf("SPIR-V loaded: %zu bytes (%zu words), Header Magic=0x%08x Valid\n",
                 spv_bytes.size(), spirv.size(), spirv[0]);
 
-    const auto manifest_path = spv_path.parent_path() / "manifest.json";
-    if (std::filesystem::exists(manifest_path)) {
-      std::ifstream mf(manifest_path);
-      nlohmann::json manifest;
-      mf >> manifest;
-      const size_t manifest_bytes = manifest.value("byte_count", size_t(0));
-      const std::string manifest_hash = manifest.value("spirv_sha256", "");
-      if (manifest_bytes != spv_bytes.size()) {
-        std::fprintf(stderr, "FATAL ERROR: Manifest byte count (%zu) does not match SPIR-V file size (%zu)\n",
-                     manifest_bytes, spv_bytes.size());
-        std::exit(1);
-      }
-      const std::string computed_hash = Common::Sha256::ComputeHex(spv_bytes);
-      if (!manifest_hash.empty() && computed_hash != manifest_hash) {
-        std::fprintf(stderr, "FATAL ERROR: Manifest hash (%s) does not match computed SPIR-V hash (%s)\n",
-                     manifest_hash.c_str(), computed_hash.c_str());
-        std::exit(1);
-      }
-      std::printf("Manifest verification passed: SHA256=%s Size=%zu bytes\n",
-                  computed_hash.c_str(), manifest_bytes);
-    }
-
     if (!std::filesystem::exists(meta_path)) {
       std::fprintf(stderr, "FATAL ERROR: Metadata file does not exist: %s\n", meta_path.string().c_str());
       std::exit(1);
@@ -12913,7 +12989,67 @@ public:
     nlohmann::json metadata;
     {
       std::ifstream mf(meta_path);
+      if (!mf.is_open()) {
+        std::fprintf(stderr, "FATAL ERROR: Could not open metadata file: %s\n", meta_path.string().c_str());
+        std::exit(1);
+      }
       mf >> metadata;
+    }
+
+    const auto manifest_path = spv_path.parent_path() / "manifest.json";
+    if (!std::filesystem::exists(manifest_path)) {
+      std::fprintf(stderr, "FATAL ERROR: Manifest file does not exist: %s\n", manifest_path.string().c_str());
+      std::exit(1);
+    }
+    nlohmann::json manifest;
+    {
+      std::ifstream mf(manifest_path);
+      if (!mf.is_open()) {
+        std::fprintf(stderr, "FATAL ERROR: Could not open manifest file: %s\n", manifest_path.string().c_str());
+        std::exit(1);
+      }
+      mf >> manifest;
+    }
+    if (!manifest.contains("byte_count") || !manifest.contains("spirv_sha256") ||
+        !manifest.contains("guest_shader_hash") || !manifest.contains("module_id")) {
+      std::fprintf(stderr, "FATAL ERROR: Manifest missing required fields (byte_count, spirv_sha256, guest_shader_hash, module_id)\n");
+      std::exit(1);
+    }
+    const size_t manifest_bytes = manifest.value("byte_count", size_t(0));
+    const std::string manifest_hash = manifest.value("spirv_sha256", "");
+    const std::string manifest_guest = manifest.value("guest_shader_hash", "");
+    const std::string manifest_module = manifest.value("module_id", "");
+    if (manifest_bytes != spv_bytes.size()) {
+      std::fprintf(stderr, "FATAL ERROR: Manifest byte count (%zu) does not match SPIR-V file size (%zu)\n",
+                   manifest_bytes, spv_bytes.size());
+      std::exit(1);
+    }
+    const std::string computed_hash = Common::Sha256::ComputeHex(spv_bytes);
+    if (!Common::EqualNoCase(computed_hash, manifest_hash)) {
+      std::fprintf(stderr, "FATAL ERROR: Manifest hash (%s) does not match computed SPIR-V hash (%s)\n",
+                   manifest_hash.c_str(), computed_hash.c_str());
+      std::exit(1);
+    }
+    const std::string meta_guest = metadata.value("guest_shader_hash", "");
+    const std::string meta_module = metadata.value("module_id", "");
+    if (!meta_guest.empty() && !Common::EqualNoCase(manifest_guest, meta_guest)) {
+      std::fprintf(stderr, "FATAL ERROR: Manifest guest hash (%s) does not match metadata guest hash (%s)\n",
+                   manifest_guest.c_str(), meta_guest.c_str());
+      std::exit(1);
+    }
+    if (!meta_module.empty() && !Common::EqualNoCase(manifest_module, meta_module)) {
+      std::fprintf(stderr, "FATAL ERROR: Manifest module ID (%s) does not match metadata module ID (%s)\n",
+                   manifest_module.c_str(), meta_module.c_str());
+      std::exit(1);
+    }
+    std::printf("Manifest verification passed: SHA256=%s Size=%zu bytes GuestHash=%s ModuleID=%s\n",
+                computed_hash.c_str(), manifest_bytes, manifest_guest.c_str(), manifest_module.c_str());
+
+    const auto& spec_constants = metadata.value("specialization_constants", nlohmann::json::array());
+    if (!spec_constants.empty()) {
+      std::fprintf(stderr, "FATAL ERROR: Nonempty specialization constants not supported for replay (%zu entries)\n",
+                   spec_constants.size());
+      std::exit(1);
     }
 
     spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
@@ -12944,6 +13080,20 @@ public:
                 VK_API_VERSION_MINOR(props.apiVersion),
                 VK_API_VERSION_PATCH(props.apiVersion));
 
+    if (metadata.contains("enabled_device_extensions")) {
+      for (const auto& ext_val : metadata["enabled_device_extensions"]) {
+        const std::string ext_name = ext_val.get<std::string>();
+        bool found = false;
+        for (const auto& dev_ext : graphics.enabled_device_extensions) {
+          if (dev_ext == ext_name) { found = true; break; }
+        }
+        if (!found) {
+          std::fprintf(stderr, "FATAL ERROR: Replay device does not have required enabled extension: %s\n", ext_name.c_str());
+          std::exit(1);
+        }
+      }
+    }
+
     vk::ShaderModuleCreateInfo sm_info{};
     sm_info.codeSize = spv_bytes.size();
     sm_info.pCode = spirv.data();
@@ -12962,6 +13112,13 @@ public:
       if (is_image_heap) {
         set_layouts.push_back(graphics.image_heap_layout);
       } else {
+        const std::string lflags_str = layout_json.value("layout_flags", "0x00000000");
+        const uint32_t raw_lflags = static_cast<uint32_t>(std::stoul(lflags_str, nullptr, 16));
+        if ((raw_lflags & static_cast<uint32_t>(vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR)) != 0 &&
+            graphics.max_push_descriptors == 0) {
+          std::fprintf(stderr, "FATAL ERROR: Layout requires push descriptors, but replay device does not support them\n");
+          std::exit(1);
+        }
         std::vector<vk::DescriptorSetLayoutBinding> bindings;
         for (const auto& b : layout_json.value("bindings", nlohmann::json::array())) {
           vk::DescriptorSetLayoutBinding binding{};
@@ -12985,6 +13142,7 @@ public:
           bindings.push_back(binding);
         }
         vk::DescriptorSetLayoutCreateInfo desc_info{};
+        desc_info.flags = vk::DescriptorSetLayoutCreateFlags(raw_lflags);
         desc_info.bindingCount = static_cast<uint32_t>(bindings.size());
         desc_info.pBindings = bindings.data();
         vk::DescriptorSetLayout desc_layout = nullptr;
@@ -13038,10 +13196,24 @@ public:
     vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info{};
     const bool has_subgroup = metadata.value("has_required_subgroup_size", false);
     const uint32_t subgroup_size = metadata.value("required_subgroup_size", 32u);
-    if (has_subgroup && graphics.compute_subgroup_size_control_enabled) {
+    if (has_subgroup) {
+      if (!graphics.compute_subgroup_size_control_enabled) {
+        std::fprintf(stderr, "FATAL ERROR: Capture requires compute subgroup size control, but replay device has it disabled\n");
+        std::exit(1);
+      }
+      if (subgroup_size < graphics.min_subgroup_size || subgroup_size > graphics.max_subgroup_size) {
+        std::fprintf(stderr, "FATAL ERROR: Required subgroup size (%u) is outside device supported range [%u, %u]\n",
+                     subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size);
+        std::exit(1);
+      }
       subgroup_size_info.requiredSubgroupSize = subgroup_size;
       stage_info.pNext = &subgroup_size_info;
     }
+
+    std::printf("Effective Subgroup Configuration passed to Vulkan: RequiredSubgroupSize=%u (Attached=%s, ControlEnabled=%s)\n",
+                has_subgroup ? subgroup_size : graphics.subgroup_size,
+                has_subgroup ? "YES" : "NO",
+                graphics.compute_subgroup_size_control_enabled ? "true" : "false");
 
     vk::ComputePipelineCreateInfo info{};
     info.flags = pipeline_flags;
@@ -23588,10 +23760,18 @@ private:
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
     vk::PhysicalDeviceProperties2 properties{};
-    properties.pNext = &m_runtime_context.mesh_shader_properties;
+    vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
+    properties.pNext = &subgroup_size_control;
+    subgroup_size_control.pNext = &m_runtime_context.mesh_shader_properties;
     m_physical_device.getProperties2(&properties);
     m_runtime_context.physical_device_properties = properties.properties;
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
+    m_runtime_context.min_subgroup_size = subgroup_size_control.minSubgroupSize;
+    m_runtime_context.max_subgroup_size = subgroup_size_control.maxSubgroupSize;
+    m_runtime_context.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
+    m_runtime_context.compute_subgroup_size_control_enabled =
+        bool(m_available_features13.subgroupSizeControl) &&
+        bool(m_runtime_context.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute);
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
@@ -23761,6 +23941,7 @@ private:
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_mesh;
     m_physical_device.getFeatures2(&available_features2);
+    m_available_features13 = available_features13;
     vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
     vk::PhysicalDeviceProperties2 properties2{};
     properties2.pNext = &robustness2_properties;
@@ -23912,9 +24093,14 @@ private:
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
     robustness2.pNext = &pipeline_robustness;
+    vk::PhysicalDeviceVulkan13Features features13{};
+    features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
+    features13.subgroupSizeControl = available_features13.subgroupSizeControl;
+    features13.computeFullSubgroups = available_features13.computeFullSubgroups;
+    features13.pNext = &robustness2;
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
-    conditional_rendering.pNext = &robustness2;
+    conditional_rendering.pNext = &features13;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     mesh.meshShader = mesh.taskShader = true;
     mesh.pNext = &conditional_rendering;
@@ -23959,6 +24145,10 @@ private:
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
+    m_runtime_context.enabled_device_extensions.clear();
+    for (const auto* ext : device_extensions) {
+      if (ext) m_runtime_context.enabled_device_extensions.emplace_back(ext);
+    }
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -24280,6 +24470,7 @@ private:
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
+  vk::PhysicalDeviceVulkan13Features m_available_features13{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
@@ -55650,12 +55841,22 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc >= 2 && std::strcmp(argv[1], "--repro-wolverine-pipeline") == 0) {
-    const std::filesystem::path spv_path = (argc >= 3) ? argv[2] : "captured_modules/CS_1a04c58a9fbc2052_75df537b334073cc/shader.spv";
-    const std::filesystem::path meta_path = (argc >= 4) ? argv[3] : "captured_modules/CS_1a04c58a9fbc2052_75df537b334073cc/pipeline_metadata.json";
+    const std::filesystem::path spv_path = (argc >= 3) ? argv[2] : "captured_modules/CS_1a04c58a9fbc2052_939ba9aac7dcf029/shader.spv";
+    const std::filesystem::path meta_path = (argc >= 4) ? argv[3] : "captured_modules/CS_1a04c58a9fbc2052_939ba9aac7dcf029/pipeline_metadata.json";
     const char* mode = (argc >= 5) ? argv[4] : "normal";
     const std::filesystem::path cache = (argc >= 6) ? argv[5] : "_PipelineCache/test_repro_normal.bin";
     VulkanHarness vulkan;
     vulkan.CheckWolverinePipelineRepro(spv_path, meta_path, mode, cache);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sha256-kat-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSha256KnownAnswers();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--instrumentation-parity-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckInstrumentationParity();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dynamic-call-retention-only") == 0) {
@@ -55671,6 +55872,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dynamic-call-all-tests-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckSha256KnownAnswers();
+    vulkan.CheckInstrumentationParity();
     vulkan.CheckDynamicCallSpecializationRetention();
     vulkan.CheckDynamicCallBranchRelocation();
     vulkan.CheckDynamicCallInMemoryRecovery();

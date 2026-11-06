@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/EmitterAttribution.h"
 
 #include "common/assert.h"
 
@@ -183,6 +184,16 @@ void Builder::AddName(uint32_t target, const char* name) {
 
 void Builder::AddFunction(std::span<const uint32_t> words) {
 	AppendInstructionWords(m_functions, words.data(), words.size());
+	if (m_attribution_tracker) {
+		for (size_t offset = 0; offset < words.size();) {
+			const uint32_t first = words[offset];
+			const auto opcode = static_cast<spv::Op>(first & spv::OpCodeMask);
+			const uint32_t word_count = first >> spv::WordCountShift;
+			if (word_count == 0) break;
+			RecordAttribution(opcode, word_count);
+			offset += word_count;
+		}
+	}
 }
 
 DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count) {
@@ -193,7 +204,14 @@ DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incom
 	m_functions.push_back(result);
 	m_functions.resize(m_functions.size() + incoming_count * 2u);
 	m_unpatched_phi_incomings += incoming_count;
+	RecordAttribution(spv::OpPhi, word_count);
 	return phi;
+}
+
+void Builder::RecordAttribution(spv::Op opcode, uint32_t word_count) {
+	if (m_attribution_tracker) {
+		m_attribution_tracker->RecordInstruction(opcode, word_count);
+	}
 }
 
 void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent) {

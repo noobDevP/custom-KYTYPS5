@@ -95,6 +95,8 @@ void EmitReturn(ValueEmitContext& ctx) {
 }
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
+	ScopedAttributionSite site(ctx.state.attribution.get(), "OriginalCFG:Terminator", OriginCategory::OriginalCfg);
+	ScopedIrOpcode ir_scope(ctx.state.attribution.get(), IR::ValueOpcode::Count);
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
@@ -233,6 +235,7 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	using Op = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
+	ScopedIrOpcode ir_scope(ctx.state.attribution.get(), op);
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
 	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 || op == Op::ReadConstBuffer ||
@@ -254,6 +257,9 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& structured,
                                const IR::Inst& inst) {
 	if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
+		ScopedIrOpcode ir_scope(ctx.state.attribution.get(), IR::ValueOpcode::Phi);
+		ScopedAttributionSite site(ctx.state.attribution.get(), "OriginalCFG:DeferredPhi",
+		                           OriginCategory::OriginalCfg);
 		const auto type = TypeId(ctx.state, inst.GetType());
 		if (type == 0 || inst.NumArgs() == 0) {
 			ctx.Fail(inst, "has no native SPIR-V representation");
@@ -294,7 +300,11 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
-	EmitLabel(ctx.state, block->Definition());
+	{
+		ScopedAttributionSite site(ctx.state.attribution.get(), "OriginalCFG:BlockLabel",
+		                           OriginCategory::OriginalCfg);
+		EmitLabel(ctx.state, block->Definition());
+	}
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
@@ -336,7 +346,11 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
-	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
+	{
+		ScopedAttributionSite site(ctx.state.attribution.get(), "OriginalCFG:EntryBranch",
+		                           OriginCategory::OriginalCfg);
+		ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
+	}
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
@@ -675,20 +689,30 @@ void EmitProgram(EmitterState& state) {
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		high.dispatcher_spills      = &dispatch.spills[1];
 	}
-	DefineGetBdaPointer(state);
-	DefineIndirectBufferLoads(ctx);
-	DefineBvhIntersect(state);
-	DefineTrinityFunctions(state);
+	{
+		ScopedFunctionScope helper_scope(state.attribution.get(), ScopeCategory::HelperFunction,
+		                                 "HelperFunction");
+		DefineGetBdaPointer(state);
+		DefineIndirectBufferLoads(ctx);
+		DefineBvhIntersect(state);
+		DefineTrinityFunctions(state);
+	}
 	if (program.info.uses_swizzle) {
 		ctx.scratch_u32_variable = state.builder.AllocateId();
 		if (state.lane_count == 2) {
 			high.scratch_u32_variable = state.builder.AllocateId();
 		}
 	}
+	ScopedFunctionScope main_scope(state.attribution.get(), ScopeCategory::MainFunction,
+	                               "MainFunction");
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
-	EmitLabel(state, state.entry_label);
+	{
+		ScopedAttributionSite site(state.attribution.get(), "OriginalCFG:EntryLabel",
+		                           OriginCategory::OriginalCfg);
+		EmitLabel(state, state.entry_label);
+	}
 	if (state.program.info.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
@@ -759,6 +783,7 @@ void EmitProgram(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	state.current_block = nullptr;
 	if (state.program.stage == ShaderType::Mesh) {
+		ScopedFunctionScope mesh_scope(state.attribution.get(), ScopeCategory::HelperFunction, "MeshEntryPoint");
 		EmitMeshEntryPoint(state);
 	}
 }

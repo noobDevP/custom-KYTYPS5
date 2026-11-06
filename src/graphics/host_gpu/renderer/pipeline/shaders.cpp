@@ -483,6 +483,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		std::error_code ec;
 		std::filesystem::create_directories(module_dir, ec);
 
+		bool all_writes_ok = true;
+
 		// 1. Exact SPIR-V bytes
 		std::string spv_sha256;
 		size_t spv_byte_count = 0;
@@ -496,6 +498,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			std::ofstream spv_file(spv_out_path, std::ios::binary | std::ios::trunc);
 			if (spv_file.is_open()) {
 				spv_file.write(reinterpret_cast<const char*>(module.spirv.data()), static_cast<std::streamsize>(spv_byte_count));
+				if (!spv_file.good()) all_writes_ok = false;
+			} else {
+				all_writes_ok = false;
 			}
 			// Also write named file in directory and root for backwards compatibility
 			const auto named_spv_path = module_dir / fmt::format("CS_{:016x}_{:016x}.spv", module.guest_shader_hash, module.id);
@@ -508,6 +513,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			if (root_file.is_open()) {
 				root_file.write(reinterpret_cast<const char*>(module.spirv.data()), static_cast<std::streamsize>(spv_byte_count));
 			}
+		} else {
+			all_writes_ok = false;
 		}
 
 		// 2. Manifest file
@@ -523,6 +530,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		std::ofstream manifest_file(manifest_path, std::ios::trunc);
 		if (manifest_file.is_open()) {
 			manifest_file << manifest.dump(2) << "\n";
+			if (!manifest_file.good()) all_writes_ok = false;
+		} else {
+			all_writes_ok = false;
 		}
 
 		// 3. Pipeline metadata
@@ -571,13 +581,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		auto desc_sets = nlohmann::json::array();
 		nlohmann::json set0;
 		set0["set"] = 0;
+		set0["layout_flags"] = fmt::format("0x{:08x}", static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}));
+		set0["uses_push_descriptors"] = pipeline.uses_push_descriptors;
 		auto b0_array = nlohmann::json::array();
 		for (const auto& b : descriptor_bindings) {
 			b0_array.push_back({
 			    {"binding", b.binding},
 			    {"descriptorType", vk::to_string(b.descriptorType)},
 			    {"descriptorCount", b.descriptorCount},
-			    {"stageFlags", fmt::format("0x{:08x}", static_cast<uint32_t>(b.stageFlags))}
+			    {"stageFlags", fmt::format("0x{:08x}", static_cast<uint32_t>(b.stageFlags))},
+			    {"binding_flags", "0x00000000"}
 			});
 		}
 		set0["bindings"] = b0_array;
@@ -590,11 +603,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			set1["layout_flags"]  = fmt::format("0x{:08x}", static_cast<uint32_t>(vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool));
 			set1["binding_flags"] = "0x00000007"; // PartiallyBound | UpdateAfterBind | UpdateUnusedWhilePending
 			set1["bindings"]      = nlohmann::json::array({
-			    {{"binding", 0}, {"descriptorType", "eSampledImage"}, {"descriptorCount", ShaderRecompiler::IR::ImageHeapCapacity}, {"stageFlags", "0x0000001f"}}
+			    {{"binding", 0}, {"descriptorType", "eSampledImage"}, {"descriptorCount", ShaderRecompiler::IR::ImageHeapCapacity}, {"stageFlags", "0x0000001f"}, {"binding_flags", "0x00000007"}}
 			});
 			desc_sets.push_back(set1);
 		}
 		meta["descriptor_set_layouts"] = desc_sets;
+
+		meta["enabled_device_extensions"] = graphics.enabled_device_extensions;
 
 		meta["enabled_device_features"] = {
 		    {"compute_subgroup_size_control", graphics.compute_subgroup_size_control_enabled},
@@ -624,6 +639,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		std::ofstream meta_file(meta_path, std::ios::trunc);
 		if (meta_file.is_open()) {
 			meta_file << meta.dump(2) << "\n";
+			if (!meta_file.good()) all_writes_ok = false;
+		} else {
+			all_writes_ok = false;
 		}
 		// Also write root legacy metadata file
 		std::ofstream legacy_meta_file("CS_1a04c58a9fbc2052_metadata.json", std::ios::trunc);
@@ -631,8 +649,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			legacy_meta_file << meta.dump(2) << "\n";
 		}
 
-		Log::WriteToConsoleAndLog(fmt::format(
-		    "Captured self-contained module bundle in {}\n", module_dir.string()));
+		if (all_writes_ok) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Captured self-contained module bundle in {}\n", module_dir.string()));
+		} else {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "ERROR: Failed to write all capture files in {}\n", module_dir.string()));
+		}
+
+		if (module.guest_shader_hash == 0x1a04c58a9fbc2052) {
+			Log::WriteToConsoleAndLog(
+			    "Attribution counters and capture bundle written. Stopping game run before vkCreateComputePipelines as requested.\n");
+			std::fflush(nullptr);
+			Common::DbgExit(0);
+		}
 	}
 
 	ScopedCompilationTrack comp_track("ComputePipeline", module.guest_shader_hash, module.id, "CS");

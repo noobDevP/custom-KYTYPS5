@@ -234,6 +234,11 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	if (program.shader_hash == 0x1a04c58a9fbc2052) {
+		state.attribution = std::make_unique<EmitterAttributionTracker>();
+		state.attribution->shader_hash = program.shader_hash;
+		state.builder.SetAttributionTracker(state.attribution.get());
+	}
 	DefineModule(state);
 	ValidateNativeProgram(program,
 	                      program.stage == ShaderType::Compute && input_info.compute->lds_storage);
@@ -241,7 +246,11 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto spirv = state.builder.Build();
+	if (state.attribution) {
+		state.attribution->PrintSummaryTables(spirv);
+	}
+	return spirv;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

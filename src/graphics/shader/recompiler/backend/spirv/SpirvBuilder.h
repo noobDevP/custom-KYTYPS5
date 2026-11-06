@@ -18,6 +18,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
+class EmitterAttributionTracker;
+
 struct TypeAnnotation {
 	spv::Op               opcode = spv::OpNop;
 	std::vector<uint32_t> operands; // Already encoded operand words.
@@ -34,6 +36,8 @@ public:
 	KYTY_CLASS_DEFAULT_COPY(Builder);
 
 	uint32_t AllocateId();
+	void     SetAttributionTracker(EmitterAttributionTracker* tracker) { m_attribution_tracker = tracker; }
+	[[nodiscard]] EmitterAttributionTracker* GetAttributionTracker() const { return m_attribution_tracker; }
 	void     RequireVersion(uint32_t version);
 	void     RequireCapability(spv::Capability capability);
 	void     RequireExtension(const char* name);
@@ -130,12 +134,13 @@ private:
 	}
 
 	template <typename... Args>
-	static void AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
-	                              const Args&... operands) {
+	void AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
+	                       const Args&... operands) {
 		const auto offset = section.size();
 		AppendOperands(section, opcode, operands...);
 		const auto word_count = static_cast<uint32_t>(section.size() - offset);
 		section[offset] |= word_count << spv::WordCountShift;
+		RecordAttribution(opcode, word_count);
 	}
 
 	struct DeclarationKeyHash {
@@ -173,6 +178,8 @@ private:
 	std::unordered_map<std::vector<uint32_t>, uint32_t, DeclarationKeyHash> m_declaration_ids;
 	size_t                                    m_unpatched_phi_incomings = 0;
 	bool                                      m_emit_names              = false;
+	EmitterAttributionTracker*                m_attribution_tracker     = nullptr;
+	void RecordAttribution(spv::Op opcode, uint32_t word_count);
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

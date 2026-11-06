@@ -842,6 +842,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
 
+	graphics.enabled_device_extensions.clear();
+	for (const auto* ext : device_extensions) {
+		if (ext) graphics.enabled_device_extensions.emplace_back(ext);
+	}
+
 	vk::Device device = nullptr;
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);

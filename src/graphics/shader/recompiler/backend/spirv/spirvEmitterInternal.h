@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/backend/spirv/EmitterAttribution.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -165,6 +166,7 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	std::unique_ptr<EmitterAttributionTracker> attribution;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -561,6 +563,7 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
                         uint32_t result_type, Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
 	EXIT_IF(count == 0u);
+	ScopedAttributionSite site_scope(state.attribution.get(), "EmitIndexSwitch", OriginCategory::EmitterControlFlow);
 	const auto merge_label = state.builder.AllocateId();
 	std::vector<uint32_t> labels(count);
 	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
@@ -596,7 +599,23 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 }
 
 template <typename Fn>
-void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn, const char* site = nullptr) {
+	if (state.attribution) {
+		const auto c_true  = ConstantBool(state, true);
+		const auto c_false = ConstantBool(state, false);
+		const auto kind    = (condition == c_true)  ? ConditionKind::ConstantTrue
+		                   : (condition == c_false) ? ConditionKind::ConstantFalse
+		                                            : ConditionKind::Dynamic;
+		state.attribution->RecordEmitIfCondition(kind);
+	}
+	const char* effective_site = site ? site : "EmitIfCondition";
+	if (!site && state.attribution && state.attribution->current_call_site &&
+	    std::strcmp(state.attribution->current_call_site, "Unclassified") != 0 &&
+	    std::strcmp(state.attribution->current_call_site, "MainFunction") != 0 &&
+	    std::strcmp(state.attribution->current_call_site, "HelperFunction") != 0) {
+		effective_site = state.attribution->current_call_site;
+	}
+	ScopedAttributionSite site_scope(state.attribution.get(), effective_site, OriginCategory::EmitterControlFlow);
 	if (condition == ConstantBool(state, true)) {
 		fn();
 		return;
@@ -613,10 +632,26 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
-                                       uint32_t default_value, Fn&& fn) {
+                                       uint32_t default_value, Fn&& fn, const char* site = nullptr) {
+	if (state.attribution) {
+		const auto c_true  = ConstantBool(state, true);
+		const auto c_false = ConstantBool(state, false);
+		const auto kind    = (condition == c_true)  ? ConditionKind::ConstantTrue
+		                   : (condition == c_false) ? ConditionKind::ConstantFalse
+		                                            : ConditionKind::Dynamic;
+		state.attribution->RecordEmitValueOrDefault(kind);
+	}
+	const char* effective_site = site ? site : "EmitValueOrDefaultIfCondition";
+	if (!site && state.attribution && state.attribution->current_call_site &&
+	    std::strcmp(state.attribution->current_call_site, "Unclassified") != 0 &&
+	    std::strcmp(state.attribution->current_call_site, "MainFunction") != 0 &&
+	    std::strcmp(state.attribution->current_call_site, "HelperFunction") != 0) {
+		effective_site = state.attribution->current_call_site;
+	}
+	ScopedAttributionSite site_scope(state.attribution.get(), effective_site, OriginCategory::EmitterControlFlow);
 	if (condition == ConstantBool(state, true)) return fn();
 	const auto then_label  = state.builder.AllocateId();
-	const auto header     = state.current_label;
+	const auto header      = state.current_label;
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
@@ -632,13 +667,14 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 }
 
 template <typename Fn>
-uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn, const char* site = nullptr) {
 	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
-	                                     std::forward<Fn>(fn));
+	                                     std::forward<Fn>(fn), site);
 }
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	ScopedAttributionSite site_scope(state.attribution.get(), "AtomicUpdate", OriginCategory::EmitterControlFlow);
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();

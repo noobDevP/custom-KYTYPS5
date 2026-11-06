@@ -988,7 +988,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				    candidate.numeric_class == Prospero::TextureNumericClass::Uint);
 				EmitStorageImageWrite(state, resource, mip_lod, coord, texel, array_index, sample);
 			});
-		});
+		}, "Image:ImageWriteActiveLane");
 		return;
 	}
 	if (op == IR::ValueOpcode::ImageSampleRaw || op == IR::ValueOpcode::ImageGatherRaw) {
@@ -1182,7 +1182,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			           const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
 			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
 			           return old;
-		           }));
+		           }, "Image:ImageAtomicActiveLane"));
 		return;
 	}
 	ctx.Fail(inst, "has no image SPIR-V emitter");

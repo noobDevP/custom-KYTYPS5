@@ -681,7 +681,7 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
 		}
-	});
+	}, "Flow:ExportExecMask");
 }
 
 uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
