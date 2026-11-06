@@ -1,0 +1,6 @@
+0x00000000: V_READFIRSTLANE_B32 s4, v0
+0x00000004: S_BUFFER_LOAD_DWORDX2 s14, s0, s4 ; offset=0 offset2=0 dwords=2 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 glc=0 dlc=0 slc=0 idxen=0 offen=0
+0x0000000c: S_WAITCNT 0x0000c07f
+0x00000010: S_SWAPPC_B64 s14, s14
+0x00000014: S_MOV_B32 s20, 1
+0x00000018: s_endpgm

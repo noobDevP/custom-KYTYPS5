@@ -1,0 +1,1519 @@
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -204,7 +204,15 @@
+ 	friend struct PipelineCacheTestAccess;
+
+ 
+
+ 	struct Program {
+
++		struct DynamicCallState {
+
++			std::unique_ptr<ShaderRecompiler::ShaderSource> source;
+
++			std::vector<uint64_t>                           target_pcs;
+
++			std::vector<uint64_t>                           target_code_hashes;
+
++			uint32_t                                        call_pc = UINT32_MAX;
+
++		};
+
++
+
+ 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
+
++		std::unique_ptr<DynamicCallState>            dynamic_call_state;
+
+ 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
+
+ 		ShaderRecompiler::IR::ResourceSnapshot       resources;
+
+ 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+
+
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -328,6 +328,12 @@
+ 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
+
+ 	                            info.bindings.push_data_start_dword, program.specialization);
+
+ 	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
+
++	if (program.dynamic_call_state) {
+
++		inputs.Raw(program.dynamic_call_state->target_pcs.data(),
+
++		           program.dynamic_call_state->target_pcs.size() * sizeof(uint64_t));
+
++		inputs.Raw(program.dynamic_call_state->target_code_hashes.data(),
+
++		           program.dynamic_call_state->target_code_hashes.size() * sizeof(uint64_t));
+
++	}
+
+ 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
+
+ 
+
+ 	const auto* stage = ShaderRecompiler::StageName(key.stage);
+
+@@ -369,6 +375,74 @@
+ 	return module;
+
+ }
+
+ 
+
++static std::vector<uint64_t> ReadSbtTargetPcs(std::span<const uint32_t> user_data) {
+
++	std::vector<uint64_t> unique_target_pcs;
+
++	if (user_data.size() < 14) {
+
++		return unique_target_pcs;
+
++	}
+
++	const uint64_t s12_ptr = (static_cast<uint64_t>(user_data[13]) << 32) | user_data[12];
+
++	std::array<uint32_t, 4> sbt_desc_words {};
+
++	if (!ReadShaderGuestMemory(nullptr, s12_ptr + 144, sbt_desc_words)) {
+
++		return unique_target_pcs;
+
++	}
+
++	ShaderBufferResource sbt_desc;
+
++	std::copy(sbt_desc_words.begin(), sbt_desc_words.end(), sbt_desc.fields);
+
++	const uint64_t sbt_base = sbt_desc.Base48();
+
++	const uint32_t sbt_size = sbt_desc.NumRecords();
+
++	const uint32_t total_records = sbt_size / 16u;
+
++	for (uint32_t i = 0; i < total_records; ++i) {
+
++		std::array<uint32_t, 4> record {};
+
++		if (ReadShaderGuestMemory(nullptr, sbt_base + i * 16u, record)) {
+
++			const uint64_t target_pc = (static_cast<uint64_t>(record[1]) << 32) | record[0];
+
++			if (target_pc != 0) {
+
++				const uint64_t clean_target = target_pc & ~3ull;
+
++				if (std::ranges::find(unique_target_pcs, clean_target) == unique_target_pcs.end()) {
+
++					unique_target_pcs.push_back(clean_target);
+
++				}
+
++			}
+
++		}
+
++	}
+
++	return unique_target_pcs;
+
++}
+
++
+
++static std::vector<uint64_t> ComputeTargetCodeHashes(const std::vector<uint64_t>& target_pcs) {
+
++	std::vector<uint64_t> hashes;
+
++	hashes.reserve(target_pcs.size());
+
++	for (uint64_t target_pc : target_pcs) {
+
++		std::vector<uint32_t> code_chunk(256);
+
++		size_t read_words = 0;
+
++		if (ReadShaderGuestMemory(nullptr, target_pc, code_chunk)) {
+
++			for (size_t i = 0; i < code_chunk.size(); ++i) {
+
++				const uint32_t w = code_chunk[i];
+
++				read_words = i + 1;
+
++				if ((w & 0xFFFF0000u) == 0xBF810000u || (w & 0xFFFF0000u) == 0xBE800000u) {
+
++					break;
+
++				}
+
++			}
+
++			hashes.push_back(XXH3_64bits(code_chunk.data(), read_words * sizeof(uint32_t)));
+
++		} else {
+
++			hashes.push_back(0);
+
++		}
+
++	}
+
++	return hashes;
+
++}
+
++
+
++static void LogDynamicCallRetentionDiagnostic(uint64_t shader_hash, ShaderType stage,
+
++                                              bool cache_hit, bool spec_miss,
+
++                                              const char* link_result, size_t target_count,
+
++                                              const char* translation_path, uint32_t call_offset) {
+
++	static std::atomic<uint32_t> s_diag_count {0};
+
++	const uint32_t count = s_diag_count.fetch_add(1, std::memory_order_relaxed);
+
++	const bool is_target_shader = (shader_hash == 0x1a04c58a9fbc2052ull);
+
++	if (count < 64 || is_target_shader) {
+
++		Log::WriteToConsoleAndLog(fmt::format(
+
++		    "[DynamicCallDiag #{}] shader=0x{:016x} stage={} cache={} spec_miss={} link={} targets={} trans_path={} call_offset=0x{:04x}\n",
+
++		    count, shader_hash, ShaderRecompiler::StageName(stage),
+
++		    cache_hit ? "HIT" : "MISS", spec_miss ? "YES" : "NO",
+
++		    link_result, target_count, translation_path, call_offset));
+
++	}
+
++}
+
++
+
+ template <typename InputInfo>
+
+ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
+
+                                               uint32_t& push_data_cursor) {
+
+@@ -411,6 +485,7 @@
+ 		return &module;
+
+ 	};
+
+ 	bool source_changed = false;
+
++	bool is_spec_miss = false;
+
+ 	if (entry != m_program_cache.end()) {
+
+ 		auto& cached = entry->second;
+
+ 		if (cached.skip_dispatch) return nullptr;
+
+@@ -418,10 +493,20 @@
+ 		if (cached.call_source) {
+
+ 			source_changed = cached.RefreshCallSource(runtime);
+
+ 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
+
++		} else if (cached.dynamic_call_state) {
+
++			const auto current_targets = ReadSbtTargetPcs(user_data);
+
++			const auto current_hashes  = ComputeTargetCodeHashes(current_targets);
+
++			if (current_targets != cached.dynamic_call_state->target_pcs ||
+
++			    current_hashes != cached.dynamic_call_state->target_code_hashes) {
+
++				source_changed = true;
+
++			} else {
+
++				module = cached.FindModule<false>(runtime, push_data_cursor);
+
++			}
+
+ 		} else {
+
+ 			module = cached.FindModule<false>(runtime, push_data_cursor);
+
+ 		}
+
+ 		if (module != nullptr) return bind(*module);
+
++		is_spec_miss = true;
+
+ 	}
+
+ 
+
+ 	options.shader_hash     = params.hash;
+
+@@ -430,87 +515,123 @@
+ 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+
+ 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+
+ 	ShaderRecompiler::ShaderSource source;
+
++	std::unique_ptr<Program::DynamicCallState> new_dynamic_state;
+
++	const char* dynamic_link_result = "none";
+
++	const char* translation_path = "direct_params_code";
+
++	size_t dynamic_target_count = 0;
+
++	uint32_t call_offset = UINT32_MAX;
+
++
+
+ 	if (entry == m_program_cache.end()) {
+
+ 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
+
+ 		                                    ShaderRecompiler::StageName(options.stage), params.hash));
+
+ 		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+
+ 		if (source.unsupported_call_pc != UINT32_MAX) {
+
+-			if (user_data.size() >= 14) {
+
+-				const uint64_t s12_ptr = (static_cast<uint64_t>(user_data[13]) << 32) | user_data[12];
+
+-				std::array<uint32_t, 4> sbt_desc_words {};
+
+-				if (ReadShaderGuestMemory(nullptr, s12_ptr + 144, sbt_desc_words)) {
+
+-					ShaderBufferResource sbt_desc;
+
+-					std::copy(sbt_desc_words.begin(), sbt_desc_words.end(), sbt_desc.fields);
+
+-					const uint64_t sbt_base = sbt_desc.Base48();
+
+-					const uint32_t sbt_size = sbt_desc.NumRecords();
+
+-					std::vector<uint64_t> unique_target_pcs;
+
+-					const uint32_t total_records = sbt_size / 16u;
+
+-					for (uint32_t i = 0; i < total_records; ++i) {
+
+-						std::array<uint32_t, 4> record {};
+
+-						if (ReadShaderGuestMemory(nullptr, sbt_base + i * 16u, record)) {
+
+-							const uint64_t target_pc = (static_cast<uint64_t>(record[1]) << 32) | record[0];
+
+-							if (target_pc != 0) {
+
+-								const uint64_t clean_target = target_pc & ~3ull;
+
+-								if (std::ranges::find(unique_target_pcs, clean_target) == unique_target_pcs.end()) {
+
+-									unique_target_pcs.push_back(clean_target);
+
+-								}
+
+-							}
+
++			call_offset = source.unsupported_call_pc;
+
++			const auto target_pcs = ReadSbtTargetPcs(user_data);
+
++			dynamic_target_count = target_pcs.size();
+
++			bool linked = false;
+
++			if (!target_pcs.empty()) {
+
++				PipelineCacheLog("Shader 0x{:016x}: linking dynamic call table with {} targets from SBT",
+
++				                 params.hash, target_pcs.size());
+
++				if (ShaderRecompiler::LinkDynamicCallTargets(source, target_pcs, runtime, params.hash)) {
+
++					PipelineCacheLog("Shader 0x{:016x}: successfully linked dynamic call table! Dispatch will execute real material shaders on GPU.",
+
++					                 params.hash);
+
++					dynamic_link_result = "success";
+
++					translation_path = "initial_dynamic_link";
+
++					const auto target_hashes = ComputeTargetCodeHashes(target_pcs);
+
++					new_dynamic_state = std::make_unique<Program::DynamicCallState>(Program::DynamicCallState {
+
++					    .source = std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)),
+
++					    .target_pcs = target_pcs,
+
++					    .target_code_hashes = target_hashes,
+
++					    .call_pc = call_offset,
+
++					});
+
++					std::string disasm = ShaderRecompiler::Decoder::ProgramToString(new_dynamic_state->source->decoded);
+
++					Common::File disasm_file(fmt::format("CS_{:016x}_linked_disasm.txt", params.hash));
+
++					if (!disasm_file.IsInvalid()) {
+
++						disasm_file.Write(disasm.data(), static_cast<uint32_t>(disasm.size()));
+
++					}
+
++					linked = true;
+
++				} else {
+
++					dynamic_link_result = "link_failed";
+
++				}
+
++			} else {
+
++				dynamic_link_result = "no_targets";
+
++			}
+
++			if (!linked) {
+
++				std::vector<uint32_t> patched_code(params.code.begin(), params.code.end());
+
++				while (source.unsupported_call_pc != UINT32_MAX) {
+
++					const auto pc = source.unsupported_call_pc;
+
++					PipelineCacheLog("Shader 0x{:016x} pc=0x{:08x}: stubbing GPU-selected callable target with S_NOP "
+
++					                 "to allow compute dispatch execution",
+
++					                 params.hash, pc);
+
++					for (const auto& inst: source.decoded.instructions) {
+
++						if (inst.pc >= (pc > 32 ? pc - 32 : 0) && inst.pc <= pc + 32) {
+
++							PipelineCacheLog("    pc=0x{:08x}: {}", inst.pc, ShaderRecompiler::Decoder::InstructionToString(inst));
+
+ 						}
+
+ 					}
+
+-					if (!unique_target_pcs.empty()) {
+
+-						PipelineCacheLog("Shader 0x{:016x}: linking dynamic call table with {} targets from SBT",
+
+-						                 params.hash, unique_target_pcs.size());
+
+-						if (ShaderRecompiler::LinkDynamicCallTargets(source, unique_target_pcs, runtime,
+
+-						                                             params.hash)) {
+
+-							PipelineCacheLog("Shader 0x{:016x}: successfully linked dynamic call table! Dispatch will execute real material shaders on GPU.",
+
+-							                 params.hash);
+
+-							std::string disasm = ShaderRecompiler::Decoder::ProgramToString(source.decoded);
+
+-							Common::File disasm_file(fmt::format("CS_{:016x}_linked_disasm.txt", params.hash));
+
+-							if (!disasm_file.IsInvalid()) {
+
+-								disasm_file.Write(disasm.data(), static_cast<uint32_t>(disasm.size()));
+
+-							}
+
+-						}
+
++					std::string disasm = ShaderRecompiler::Decoder::ProgramToString(source.decoded);
+
++					Common::File disasm_file(fmt::format("CS_{:016x}_disasm.txt", params.hash));
+
++					if (!disasm_file.IsInvalid()) {
+
++						disasm_file.Write(disasm.data(), static_cast<uint32_t>(disasm.size()));
+
+ 					}
+
++					const uint32_t word_idx = pc / sizeof(uint32_t);
+
++					if (word_idx >= patched_code.size()) {
+
++						break;
+
++					}
+
++					const auto found_inst = std::ranges::find_if(source.decoded.instructions, [pc](const auto& inst) {
+
++						return inst.pc == pc;
+
++					});
+
++					const uint32_t count = (found_inst != source.decoded.instructions.end() && found_inst->word_count > 0)
+
++					                           ? found_inst->word_count : 1u;
+
++					for (uint32_t w = 0; w < count && (word_idx + w) < patched_code.size(); ++w) {
+
++						// 0xbf800000u is GCN/RDNA2 's_nop 0' (SOPP opcode 0)
+
++						patched_code[word_idx + w] = 0xbf800000u;
+
++					}
+
++					source = ShaderRecompiler::PrepareShaderSource(patched_code, options);
+
+ 				}
+
+-			}
+
+-			std::vector<uint32_t> patched_code(params.code.begin(), params.code.end());
+
+-			while (source.unsupported_call_pc != UINT32_MAX) {
+
+-				const auto pc = source.unsupported_call_pc;
+
+-				PipelineCacheLog("Shader 0x{:016x} pc=0x{:08x}: stubbing GPU-selected callable target with S_NOP "
+
+-				                 "to allow compute dispatch execution",
+
+-				                 params.hash, pc);
+
+-				for (const auto& inst: source.decoded.instructions) {
+
+-					if (inst.pc >= (pc > 32 ? pc - 32 : 0) && inst.pc <= pc + 32) {
+
+-						PipelineCacheLog("    pc=0x{:08x}: {}", inst.pc, ShaderRecompiler::Decoder::InstructionToString(inst));
+
+-					}
+
+-				}
+
+-				std::string disasm = ShaderRecompiler::Decoder::ProgramToString(source.decoded);
+
+-				Common::File disasm_file(fmt::format("CS_{:016x}_disasm.txt", params.hash));
+
+-				if (!disasm_file.IsInvalid()) {
+
+-					disasm_file.Write(disasm.data(), static_cast<uint32_t>(disasm.size()));
+
+-				}
+
+-				const uint32_t word_idx = pc / sizeof(uint32_t);
+
+-				if (word_idx >= patched_code.size()) {
+
+-					break;
+
+-				}
+
+-				const auto found_inst = std::ranges::find_if(source.decoded.instructions, [pc](const auto& inst) {
+
+-					return inst.pc == pc;
+
+-				});
+
+-				const uint32_t count = (found_inst != source.decoded.instructions.end() && found_inst->word_count > 0)
+
+-				                           ? found_inst->word_count : 1u;
+
+-				for (uint32_t w = 0; w < count && (word_idx + w) < patched_code.size(); ++w) {
+
+-					// 0xbf800000u is GCN/RDNA2 's_nop 0' (SOPP opcode 0)
+
+-					patched_code[word_idx + w] = 0xbf800000u;
+
+-				}
+
+-				source = ShaderRecompiler::PrepareShaderSource(patched_code, options);
+
+-			}
+
+-		}
+
+-	}
+
+-	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
+
++				translation_path = "direct_stubbed_nop";
+
++			}
+
++		}
+
++	} else if (entry->second.dynamic_call_state != nullptr) {
+
++		auto& dyn_state = *entry->second.dynamic_call_state;
+
++		call_offset = dyn_state.call_pc;
+
++		dynamic_target_count = dyn_state.target_pcs.size();
+
++		if (source_changed) {
+
++			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+
++			const auto target_pcs = ReadSbtTargetPcs(user_data);
+
++			dynamic_target_count = target_pcs.size();
+
++			if (!target_pcs.empty() && ShaderRecompiler::LinkDynamicCallTargets(source, target_pcs, runtime, params.hash)) {
+
++				const auto target_hashes = ComputeTargetCodeHashes(target_pcs);
+
++				dyn_state.source = std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source));
+
++				dyn_state.target_pcs = target_pcs;
+
++				dyn_state.target_code_hashes = target_hashes;
+
++				entry->second.modules.clear();
+
++				dynamic_link_result = "relinked";
+
++				translation_path = "dynamic_source_relinked";
+
++			} else {
+
++				dynamic_link_result = "relink_failed";
+
++				translation_path = "relink_failed_fallback";
+
++			}
+
++		} else {
+
++			dynamic_link_result = "reused";
+
++			translation_path = "dynamic_source_reused";
+
++		}
+
++	}
+
++
+
++	const ShaderRecompiler::ShaderSource* current = nullptr;
+
++	if (entry == m_program_cache.end()) {
+
++		current = new_dynamic_state ? new_dynamic_state->source.get() : &source;
+
++	} else if (entry->second.dynamic_call_state != nullptr && entry->second.dynamic_call_state->source != nullptr) {
+
++		current = entry->second.dynamic_call_state->source.get();
+
++	} else if (entry->second.call_source != nullptr) {
+
++		current = entry->second.call_source.get();
+
++		translation_path = "static_call_source";
+
++	}
+
++
+
+ 	ShaderRecompiler::TranslateResult translated;
+
+ 	if (current != nullptr) {
+
+ 		if (!current->calls.empty()) {
+
+-			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+
++			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*const_cast<ShaderRecompiler::ShaderSource*>(current), runtime);
+
+ 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+
+ 			translated.program.source_reads = current->reads;
+
+ 		} else {
+
+@@ -519,21 +640,35 @@
+ 	} else {
+
+ 		translated = ShaderRecompiler::TranslateProgram(params.code, options);
+
+ 	}
+
++
+
++	LogDynamicCallRetentionDiagnostic(params.hash, options.stage,
+
++	                                  /*cache_hit=*/entry != m_program_cache.end(),
+
++	                                  /*spec_miss=*/is_spec_miss,
+
++	                                  dynamic_link_result, dynamic_target_count,
+
++	                                  translation_path, call_offset);
+
++
+
+ 	if (entry == m_program_cache.end()) {
+
+-		auto retained = !source.calls.empty()
+
++		auto retained = (new_dynamic_state == nullptr && !source.calls.empty())
+
+ 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
+
+ 		                    : nullptr;
+
+ 		entry = m_program_cache.emplace(m_lookup_key, Program {
+
+-		    .call_source   = std::move(retained),
+
+-		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+
++		    .call_source        = std::move(retained),
+
++		    .dynamic_call_state = std::move(new_dynamic_state),
+
++		    .resource_plan      = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+
+ 		}).first;
+
+ 		auto& program = entry->second;
+
+ 		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+
+ 		    program.resource_plan, runtime, program.resources, program.specialization));
+
+ 	} else if (source_changed) {
+
+ 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+
+-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+
+-			return bind(*module);
+
++		if (entry->second.call_source) {
+
++			if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+
++				return bind(*module);
+
++			}
+
++		} else {
+
++			if (const auto* module = entry->second.FindModule<false>(runtime, push_data_cursor)) {
+
++				return bind(*module);
+
++			}
+
+ 		}
+
+ 	}
+
+ 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
+
+
+--- a/src/graphics/shader/recompiler/ShaderRecompiler.cpp
++++ b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+@@ -887,7 +887,7 @@
+ 					break;
+
+ 				}
+
+ 				inst = {};
+
+-				Decoder::DecodeInstruction(words, current_inst_pc, inst);
+
++				Decoder::DecodeInstruction(words, 0, inst);
+
+ 				if (inst.word_count <= count) {
+
+ 					read_ok = true;
+
+ 					break;
+
+
+--- a/src/graphics/presentation/videoOut.h
++++ b/src/graphics/presentation/videoOut.h
+@@ -8,6 +8,7 @@
+ #include "kernel/eventQueue.h"
+
+ 
+
+ #include <memory>
+
++#include <string>
+
+ 
+
+ namespace Libs::Graphics {
+
+ class CommandBuffer;
+
+@@ -107,6 +108,10 @@
+ KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
+
+ KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
+
+ 
+
++uint64_t VideoOutGetFlipsPreparedTotal() noexcept;
+
++uint64_t VideoOutGetFlipsCompletedTotal() noexcept;
+
++std::string VideoOutGetQueueStateSummary();
+
++
+
+ } // namespace Libs::VideoOut
+
+ 
+
+ #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_VIDEOOUT_H_ */
+
+
+--- a/src/graphics/presentation/videoOut.cpp
++++ b/src/graphics/presentation/videoOut.cpp
+@@ -223,6 +223,7 @@
+ 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
+
+ 	void Wait(VideoOutConfig& cfg, int index);
+
+ 	void DumpState();
+
++	std::string GetQueueStateSummary();
+
+ 
+
+ private:
+
+ 	enum class RequestState { Reserved, Recording, Ready, Presenting };
+
+@@ -1082,6 +1083,21 @@
+ 	Common::LockGuard lock(cfg.mutex);
+
+ 	cfg.flip_status.flipPendingNum = 0;
+
+ 	cfg.flip_status.gcQueueNum     = 0;
+
++}
+
++
+
++static std::atomic<uint64_t> g_flips_prepared_total {0};
+
++static std::atomic<uint64_t> g_flips_completed_total {0};
+
++
+
++uint64_t VideoOutGetFlipsPreparedTotal() noexcept {
+
++	return g_flips_prepared_total.load(std::memory_order_relaxed);
+
++}
+
++
+
++uint64_t VideoOutGetFlipsCompletedTotal() noexcept {
+
++	return g_flips_completed_total.load(std::memory_order_relaxed);
+
++}
+
++
+
++std::string VideoOutGetQueueStateSummary() {
+
++	return DriverState().GetFlipQueue().GetQueueStateSummary();
+
+ }
+
+ 
+
+ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+
+@@ -1194,6 +1210,7 @@
+ 	}
+
+ 	prepared->frame = frame;
+
+ 	prepared->premultiplied_alpha = premultiplied_alpha;
+
++	g_flips_prepared_total.fetch_add(1, std::memory_order_relaxed);
+
+ }
+
+ 
+
+ void FlipQueue::Complete(uint64_t request_id) {
+
+@@ -1206,6 +1223,7 @@
+ 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
+
+ 		}
+
+ 		request->state = RequestState::Ready;
+
++		g_flips_completed_total.fetch_add(1, std::memory_order_relaxed);
+
+ 		m_submit_cond_var.Signal();
+
+ 		m_mutex.Unlock();
+
+ 		return;
+
+@@ -1272,6 +1290,21 @@
+ 		Log::WriteToConsoleAndLog(fmt::format(
+
+ 		    "    CpuReq id={} group={} idx={} src=CPU\n", r.id, r.group, r.index));
+
+ 	}
+
++}
+
++
+
++std::string FlipQueue::GetQueueStateSummary() {
+
++	Common::LockGuard lock(m_mutex);
+
++	int reserved = 0, recording = 0, ready = 0, presenting = 0;
+
++	for (const auto& r: m_requests) {
+
++		switch (r.state) {
+
++			case RequestState::Reserved:   ++reserved; break;
+
++			case RequestState::Recording:  ++recording; break;
+
++			case RequestState::Ready:      ++ready; break;
+
++			case RequestState::Presenting: ++presenting; break;
+
++		}
+
++	}
+
++	return fmt::format("req_total={} (rsv={} rec={} rdy={} prs={}) cpu_pending={}",
+
++	                   m_requests.size(), reserved, recording, ready, presenting, m_cpu_requests.size());
+
+ }
+
+ 
+
+ bool FlipQueue::Flip(uint32_t micros) {
+
+@@ -1337,6 +1370,25 @@
+ 			m_presenter.Discard(*hidden);
+
+ 		}
+
+ 		if (layer_count != 0) {
+
++			static std::atomic<uint32_t> s_present_sample_count {0};
+
++			const uint32_t sample_idx = s_present_sample_count.fetch_add(1, std::memory_order_relaxed);
+
++			if (sample_idx < 16) {
+
++				const auto& r = requests[0];
+
++				uint64_t buf_addr = 0;
+
++				uint64_t fmt = 0;
+
++				if (r.index >= 0 && r.index < static_cast<int>(r.cfg->buffers.size())) {
+
++					const auto& buf = r.cfg->buffers[r.index];
+
++					buf_addr = buf.data_address;
+
++					if (buf.group_index >= 0 && buf.group_index < static_cast<int>(r.cfg->groups.size())) {
+
++						fmt = r.cfg->groups[buf.group_index].attribute.pixel_format;
+
++					}
+
++				}
+
++				const bool is_blank = IsSpecialBufferIndex(r.index);
+
++				Log::WriteToConsoleAndLog(fmt::format(
+
++				    "[PresentationSample #{}] newly_completed=YES req_id={} bus={} buf_idx={} buf_addr=0x{:016x} fmt=0x{:x} dims={}x{} blank={}\n",
+
++				    sample_idx, r.id, r.cfg->bus, r.index, buf_addr, fmt,
+
++				    r.cfg->width, r.cfg->height, is_blank ? "true" : "false"));
+
++			}
+
+ 			m_presenter.Present(std::span(layers.data(), layer_count));
+
+ 		}
+
+ 		if (requests[0].cfg->bus == 0) {
+
+
+--- a/src/graphics/presentation/presenter.h
++++ b/src/graphics/presentation/presenter.h
+@@ -44,6 +44,10 @@
+ 	struct Impl;
+
+ 	std::unique_ptr<Impl> m_impl;
+
+ };
+
++
+
++uint64_t PresenterGetNewFramesPresentedTotal() noexcept;
+
++uint64_t PresenterGetFramesRedisplayedTotal() noexcept;
+
++
+
+ } // namespace Libs::Graphics
+
+ 
+
+ #endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_PRESENTER_H_
+
+
+--- a/src/graphics/presentation/window/swapchain.cpp
++++ b/src/graphics/presentation/window/swapchain.cpp
+@@ -1040,11 +1040,32 @@
+ 	return *frame;
+
+ }
+
+ 
+
++static std::atomic<uint64_t> g_frames_presented_new_total {0};
+
++static std::atomic<uint64_t> g_frames_redisplayed_total {0};
+
++
+
++uint64_t PresenterGetNewFramesPresentedTotal() noexcept {
+
++	return g_frames_presented_new_total.load(std::memory_order_relaxed);
+
++}
+
++
+
++uint64_t PresenterGetFramesRedisplayedTotal() noexcept {
+
++	return g_frames_redisplayed_total.load(std::memory_order_relaxed);
+
++}
+
++
+
+ bool Presenter::PresentLastFrame() {
+
+ 	Common::LockGuard lock(m_impl->present_mutex);
+
+ 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
+
+ 		return false;
+
+ 	}
+
++	g_frames_redisplayed_total.fetch_add(1, std::memory_order_relaxed);
+
++	static std::atomic<uint32_t> s_redisplay_samples {0};
+
++	const uint32_t sample = s_redisplay_samples.fetch_add(1, std::memory_order_relaxed);
+
++	if (sample < 16) {
+
++		const auto* frame = m_impl->layers[0].frame;
+
++		const bool is_blank = frame ? frame->blank : false;
+
++		Log::WriteToConsoleAndLog(fmt::format(
+
++		    "[PresentationSample (Redisplay) #{}] newly_completed=NO bus=0 blank={}\n",
+
++		    sample, is_blank ? "true" : "false"));
+
++	}
+
+ 	m_impl->Present();
+
+ 	return true;
+
+ }
+
+@@ -1073,6 +1094,7 @@
+ }
+
+ 
+
+ void Presenter::Present(std::span<const Layer> layers) {
+
++	g_frames_presented_new_total.fetch_add(1, std::memory_order_relaxed);
+
+ 	Common::LockGuard lock(m_impl->present_mutex);
+
+ 	for (const auto& layer: layers) {
+
+ 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
+
+
+--- a/src/graphics/presentation/window/window.cpp
++++ b/src/graphics/presentation/window/window.cpp
+@@ -17,6 +17,7 @@
+ #include "graphics/host_gpu/renderer/renderContext.h"
+
+ #include "graphics/host_gpu/vulkanCommon.h"
+
+ #include "graphics/presentation/performanceOverlay.h"
+
++#include "graphics/presentation/presenter.h"
+
+ #include "graphics/presentation/renderDoc.h"
+
+ #include "graphics/presentation/systemOverlay.h"
+
+ #include "graphics/presentation/videoOut.h"
+
+@@ -989,6 +990,10 @@
+ 		constexpr auto counter_count = static_cast<int>(Counter::Count);
+
+ 		static uint64_t previous[counter_count] {};
+
+ 		static uint64_t previous_ms = 0;
+
++		static uint64_t prev_prepared = 0;
+
++		static uint64_t prev_completed = 0;
+
++		static uint64_t prev_presented_new = 0;
+
++		static uint64_t prev_redisplayed = 0;
+
+ 
+
+ 		const auto now_ms = SDL_GetTicks();
+
+ 		if (previous_ms != 0) {
+
+@@ -998,6 +1003,36 @@
+ 				           ? static_cast<double>(Get(counter) - previous[static_cast<int>(counter)]) / seconds
+
+ 				           : 0.0;
+
+ 			};
+
++			const auto cur_prepared = VideoOut::VideoOutGetFlipsPreparedTotal();
+
++			const auto cur_completed = VideoOut::VideoOutGetFlipsCompletedTotal();
+
++			const auto cur_presented_new = Graphics::PresenterGetNewFramesPresentedTotal();
+
++			const auto cur_redisplayed = Graphics::PresenterGetFramesRedisplayedTotal();
+
++
+
++			const auto rate_prep = seconds > 0.0 ? static_cast<double>(cur_prepared - prev_prepared) / seconds : 0.0;
+
++			const auto rate_comp = seconds > 0.0 ? static_cast<double>(cur_completed - prev_completed) / seconds : 0.0;
+
++			const auto rate_pres_new = seconds > 0.0 ? static_cast<double>(cur_presented_new - prev_presented_new) / seconds : 0.0;
+
++			const auto rate_redisplay = seconds > 0.0 ? static_cast<double>(cur_redisplayed - prev_redisplayed) / seconds : 0.0;
+
++
+
++			prev_prepared = cur_prepared;
+
++			prev_completed = cur_completed;
+
++			prev_presented_new = cur_presented_new;
+
++			prev_redisplayed = cur_redisplayed;
+
++
+
++			static const bool diag_enabled = [] {
+
++				if (const char* env = std::getenv("KYTY_PRESENTATION_DIAGNOSTICS")) {
+
++					return std::strcmp(env, "0") != 0;
+
++				}
+
++				return (has_title_id && std::strcmp(title_id, "PPSA03671") == 0);
+
++			}();
+
++
+
++			if (diag_enabled) {
+
++				Log::WriteToConsoleAndLog(fmt::format(
+
++				    "[PresentationDiag 1s] req={:.1f}/s prep={:.1f}/s comp={:.1f}/s pres_new={:.1f}/s redisplay={:.1f}/s | queue: {} | comp: shaders={:.0f}/s pipes={:.0f}/s\n",
+
++				    rate(Counter::FlipsRequested), rate_prep, rate_comp, rate_pres_new, rate_redisplay,
+
++				    VideoOut::VideoOutGetQueueStateSummary(),
+
++				    rate(Counter::ShadersCompiled), rate(Counter::PipelinesCreated)));
+
++			}
+
++
+
+ 			Log::WriteToConsoleAndLog(fmt::format(
+
+ 			    "PERF frame={} fps={:.1f} draw/s={:.0f} dispatch/s={:.0f} submit/s={:.0f} "
+
+ 			    "shader_comp/s={:.0f} pipe_comp/s={:.0f} gpu_wait_ms/s={:.0f} gpu_waits/s={:.0f} "
+
+
+--- a/tests/ShaderRecompilerComputeTests.cpp
++++ b/tests/ShaderRecompilerComputeTests.cpp
+@@ -614,6 +614,12 @@
+       count++;
+
+     }
+
+     return count;
+
++  }
+
++
+
++  static void InvalidateProgramModules(PipelineCache &cache) {
+
++    for (auto &[key, prog] : cache.m_program_cache) {
+
++      prog.modules.clear();
+
++    }
+
+   }
+
+ 
+
+   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
+
+@@ -11921,6 +11927,129 @@
+     context.ShutdownGpu();
+
+     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+
+             "call fixture release failed");
+
++    std::printf("[gpu]     %-32s ok\n", name);
+
++  }
+
++
+
++  void CheckDynamicCallSpecializationRetention() {
+
++    constexpr const char* name = "DynamicCallSpecializationRetention";
+
++    constexpr uintptr_t base = 0x0000000205800000ull;
+
++    constexpr uint64_t size = 0x10000;
+
++    constexpr auto table = base + 0x100;
+
++    constexpr auto sbt_base = base + 0x800;
+
++    constexpr auto first = base + 0x1000;
+
++    constexpr auto second = base + 0x2000;
+
++    constexpr auto s12_base = base + 0x3000;
+
++    constexpr auto output = base + 0x4000;
+
++
+
++    // Caller compute shader with dynamic call at S_SWAPPC_B64 s14, s14
+
++    std::vector<u32> code{
+
++        EncodeVop1(0x02, 4, 256),                     // v_readfirstlane_b32 s4, v0
+
++        EncodeSmem0(0x09, 14, 0), EncodeSmem1(0, 4),  // s_buffer_load_dwordx2 s14, s[0:3], s4
+
++        0xbf8cc07fu,                                  // s_waitcnt 0
+
++        EncodeSop1(0x21, 14, 14),                     // s_swappc_b64 s14, s14
+
++        EncodeSMovB32(20, InlineU32(1)),
+
++        0xbf810000u                                   // s_endpgm
+
++    };
+
++    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+
++        {.type = Prospero::ShaderBinaryType::kCs,
+
++         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+
++
+
++    EnsureRuntimeContext();
+
++    int64_t physical = -1;
+
++    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+
++        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+
++        "call fixture allocation failed");
+
++    void* mapped = reinterpret_cast<void*>(base);
+
++    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+
++        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+
++        "call fixture mapping failed");
+
++    std::memset(mapped, 0, size);
+
++
+
++    const ShaderBufferResource table_desc{{static_cast<u32>(table),
+
++        static_cast<u32>(table >> 32u) | (16u << 16u), 8, 0x5204u}};
+
++    LibKernel::Memory::WriteBacking(base, table_desc.fields, sizeof(table_desc.fields));
+
++
+
++    // SBT descriptor at s12_base + 144 pointing to sbt_base
+
++    ShaderBufferResource sbt_desc{};
+
++    sbt_desc.UpdateAddress48(sbt_base);
+
++    sbt_desc.fields[2] = 32; // 2 records of 16 bytes
+
++    sbt_desc.fields[3] = 0x5204u;
+
++    LibKernel::Memory::WriteBacking(s12_base + 144, sbt_desc.fields, sizeof(sbt_desc.fields));
+
++
+
++    // SBT records at sbt_base
+
++    std::array<u32, 4> record1{static_cast<u32>(first), static_cast<u32>(first >> 32u), 0, 0};
+
++    std::array<u32, 4> record2{static_cast<u32>(second), static_cast<u32>(second >> 32u), 0, 0};
+
++    LibKernel::Memory::WriteBacking(sbt_base, record1.data(), sizeof(record1));
+
++    LibKernel::Memory::WriteBacking(sbt_base + 16, record2.data(), sizeof(record2));
+
++
+
++    // Callees at first and second
+
++    const std::array leaf1{EncodeSMovB32(20, 255), 41u, EncodeSop1(0x21, 125, 14)};
+
++    const std::array leaf2{EncodeSMovB32(20, 255), 73u, EncodeSop1(0x21, 125, 14)};
+
++    LibKernel::Memory::WriteBacking(first, leaf1.data(), sizeof(leaf1));
+
++    LibKernel::Memory::WriteBacking(second, leaf2.data(), sizeof(leaf2));
+
++
+
++    RenderContext context(m_runtime_context);
+
++    context.InitializeGpu(nullptr);
+
++    LibKernel::Memory::InstallGpuResources(&context);
+
++    context.GetGpu().SendCommandSync([&] {
+
++      CommandProcessor processor(context, 0);
+
++      processor.BufferInit();
+
++      context.MapMemory(base, size);
+
++      auto& shaders = processor.GetShCtx();
+
++      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+
++                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+
++                           .wave_size = 64, .user_sgpr = 14});
+
++      ShaderBufferResource out{};
+
++      out.UpdateAddress48(output);
+
++      out.fields[2] = 4;
+
++      out.fields[3] = DstSel(4, 5, 6, 7) |
+
++          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+
++      for (u32 i = 0; i < 4; ++i)
+
++        shaders.SetCsUserSgpr(i, out.fields[i]);
+
++      shaders.SetCsUserSgpr(12, static_cast<u32>(s12_base));
+
++      shaders.SetCsUserSgpr(13, static_cast<u32>(s12_base >> 32u));
+
++
+
++      // 1. Initial compile: wave_size = 64
+
++      ShaderComputeInputInfo input1{};
+
++      const auto program1 = context.GetPipelineCache().GetComputeProgram(
+
++          shaders.GetCs(), input1);
+
++      Require(name, "initial dynamic call compilation", program1 != nullptr,
+
++              "initial dynamic call compile failed");
+
++      const uint64_t initial_id = program1->id;
+
++
+
++      // 2. Specialization miss on existing Program entry: invalidate compiled modules
+
++      // Tests that when an existing Program entry has a module miss, the retained
+
++      // dynamic call source is reused rather than falling back to unlinked NOPs.
+
++      PipelineCacheTestAccess::InvalidateProgramModules(context.GetPipelineCache());
+
++      ShaderComputeInputInfo input2{};
+
++      const auto program2 = context.GetPipelineCache().GetComputeProgram(
+
++          shaders.GetCs(), input2);
+
++      Require(name, "second specialization compilation", program2 != nullptr,
+
++              "specialization miss compile failed");
+
++      Require(name, "retained dynamic call implementation",
+
++              program2->id == initial_id,
+
++              "dynamic call implementation was lost on specialization miss");
+
++
+
++      // 3. Stale cache invalidation check: modify callee code
+
++      const std::array modified_leaf{EncodeSMovB32(20, 255), 99u, EncodeSop1(0x21, 125, 14)};
+
++      LibKernel::Memory::WriteBacking(first, modified_leaf.data(), sizeof(modified_leaf));
+
++      Require(name, "invalidate memory", context.InvalidateMemory(first, sizeof(modified_leaf)),
+
++              "callee invalidation failed");
+
++
+
++      // Trigger re-compilation with callee code change
+
++      ShaderComputeInputInfo input3{};
+
++      const auto program3 = context.GetPipelineCache().GetComputeProgram(
+
++          shaders.GetCs(), input3);
+
++      Require(name, "re-linked module on code change", program3 != nullptr && program3->id != initial_id,
+
++              "stale linked dynamic shader was reused when callable code changed");
+
++
+
++      context.UnmapMemory(base, size);
+
++      context.GetCommandScheduler().Finish();
+
++    });
+
++    LibKernel::Memory::InstallGpuResources(nullptr);
+
++    context.ShutdownGpu();
+
++    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+
++            "dynamic call fixture release failed");
+
+     std::printf("[gpu]     %-32s ok\n", name);
+
+   }
+
+ 
+
+@@ -54443,6 +54572,11 @@
+     vulkan.CheckGpuTilerCpuParity();
+
+     return 0;
+
+   }
+
++  if (argc == 2 && std::strcmp(argv[1], "--dynamic-call-retention-only") == 0) {
+
++    VulkanHarness vulkan;
+
++    vulkan.CheckDynamicCallSpecializationRetention();
+
++    return 0;
+
++  }
+
+   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
+
+     VulkanHarness vulkan;
+
+     vulkan.CheckScalarLeafCall();
+
+@@ -55045,6 +55179,7 @@
+   }
+
+   vulkan.CheckGpuSuspendPoint();
+
+   vulkan.CheckGpuCommandLane();
+
++  vulkan.CheckDynamicCallSpecializationRetention();
+
+   vulkan.CheckScalarLeafCall();
+
+   if (skipped_device_checks) {
+
+     std::printf(

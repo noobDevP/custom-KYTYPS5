@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 19, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "performance-windows",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/_Build/windows_perf",
+      "environment": {
+        "PATH": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin;C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64;C:/Program Files (x86)/Windows Kits/10/bin/10.0.28000.0/x64;$penv{PATH}",
+        "INCLUDE": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include;C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/ATLMFC/include;C:/Program Files/Microsoft Visual Studio/18/Community/VC/Auxiliary/VS/include;C:/Program Files (x86)/Windows Kits/10/include/10.0.28000.0/ucrt;C:/Program Files (x86)/Windows Kits/10/include/10.0.28000.0/um;C:/Program Files (x86)/Windows Kits/10/include/10.0.28000.0/shared;C:/Program Files (x86)/Windows Kits/10/include/10.0.28000.0/winrt;C:/Program Files (x86)/Windows Kits/10/include/10.0.28000.0/cppwinrt;C:/Program Files (x86)/Windows Kits/NETFXSDK/4.8/include/um",
+        "LIB": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/ATLMFC/lib/x64;C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64;C:/Program Files (x86)/Windows Kits/NETFXSDK/4.8/lib/um/x64;C:/Program Files (x86)/Windows Kits/10/lib/10.0.28000.0/ucrt/x64;C:/Program Files (x86)/Windows Kits/10/lib/10.0.28000.0/um/x64",
+        "LIBPATH": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/ATLMFC/lib/x64;C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
+        "CMAKE_LINKER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/lld-link.exe",
+        "CMAKE_RC_COMPILER": "C:/Program Files (x86)/Windows Kits/10/bin/10.0.28000.0/x64/rc.exe",
+        "CMAKE_MT": "C:/Program Files (x86)/Windows Kits/10/bin/10.0.28000.0/x64/mt.exe",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON",
+        "CMAKE_EXE_LINKER_FLAGS": "/STACK:0x4000000,0x100000",
+        "KYTY_GLSLANG_VALIDATOR": "${sourceDir}/3rdparty/glslang/bin/glslang.exe",
+        "KYTY_BUILD_LAUNCHER": "OFF",
+        "KYTY_ENABLE_VALIDATION": "OFF",
+        "KYTY_FORCE_DISABLE_DEBUG_DUMPS": "ON",
+        "KYTY_PRESENT_MODE": "Immediate",
+        "KYTY_USE_SHADER_CACHE": "ON",
+        "KYTY_ENABLE_PERF_MODE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "performance-windows",
+      "configurePreset": "performance-windows",
+      "targets": [ "kyty_emulator" ]
+    }
+  ]
+}

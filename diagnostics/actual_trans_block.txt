@@ -1,0 +1,113 @@
+options.shader_hash     = params.hash;
+	options.user_data       = user_data;
+	options.back_code       = params.back_code;
+	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	ShaderRecompiler::ShaderSource source;
+	if (entry == m_program_cache.end()) {
+		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
+		                                    ShaderRecompiler::StageName(options.stage), params.hash));
+		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (source.unsupported_call_pc != UINT32_MAX) {
+			if (user_data.size() >= 14) {
+				const uint64_t s12_ptr = (static_cast<uint64_t>(user_data[13]) << 32) | user_data[12];
+				std::array<uint32_t, 4> sbt_desc_words {};
+				if (ReadShaderGuestMemory(nullptr, s12_ptr + 144, sbt_desc_words)) {
+					ShaderBufferResource sbt_desc;
+					std::copy(sbt_desc_words.begin(), sbt_desc_words.end(), sbt_desc.fields);
+					const uint64_t sbt_base = sbt_desc.Base48();
+					const uint32_t sbt_size = sbt_desc.NumRecords();
+					std::vector<uint64_t> unique_target_pcs;
+					const uint32_t total_records = sbt_size / 16u;
+					for (uint32_t i = 0; i < total_records; ++i) {
+						std::array<uint32_t, 4> record {};
+						if (ReadShaderGuestMemory(nullptr, sbt_base + i * 16u, record)) {
+							const uint64_t target_pc = (static_cast<uint64_t>(record[1]) << 32) | record[0];
+							if (target_pc != 0) {
+								const uint64_t clean_target = target_pc & ~3ull;
+								if (std::ranges::find(unique_target_pcs, clean_target) == unique_target_pcs.end()) {
+									unique_target_pcs.push_back(clean_target);
+								}
+							}
+						}
+					}
+					if (!unique_target_pcs.empty()) {
+						PipelineCacheLog("Shader 0x{:016x}: linking dynamic call table with {} targets from SBT",
+						                 params.hash, unique_target_pcs.size());
+						if (ShaderRecompiler::LinkDynamicCallTargets(source, unique_target_pcs, runtime,
+						                                             params.hash)) {
+							PipelineCacheLog("Shader 0x{:016x}: successfully linked dynamic call table! Dispatch will execute real material shaders on GPU.",
+							                 params.hash);
+							std::string disasm = ShaderRecompiler::Decoder::ProgramToString(source.decoded);
+							Common::File disasm_file(fmt::format("CS_{:016x}_linked_disasm.txt", params.hash));
+							if (!disasm_file.IsInvalid()) {
+								disasm_file.Write(disasm.data(), static_cast<uint32_t>(disasm.size()));
+							}
+						}
+					}
+				}
+			}
+			std::vector<uint32_t> patched_code(params.code.begin(), params.code.end());
+			while (source.unsupported_call_pc != UINT32_MAX) {
+				const auto pc = source.unsupported_call_pc;
+				PipelineCacheLog("Shader 0x{:016x} pc=0x{:08x}: stubbing GPU-selected callable target with S_NOP "
+				                 "to allow compute dispatch execution",
+				                 params.hash, pc);
+				for (const auto& inst: source.decoded.instructions) {
+					if (inst.pc >= (pc > 32 ? pc - 32 : 0) && inst.pc <= pc + 32) {
+						PipelineCacheLog("    pc=0x{:08x}: {}", inst.pc, ShaderRecompiler::Decoder::InstructionToString(inst));
+					}
+				}
+				std::string disasm = ShaderRecompiler::Decoder::ProgramToString(source.decoded);
+				Common::File disasm_file(fmt::format("CS_{:016x}_disasm.txt", params.hash));
+				if (!disasm_file.IsInvalid()) {
+					disasm_file.Write(disasm.data(), static_cast<uint32_t>(disasm.size()));
+				}
+				const uint32_t word_idx = pc / sizeof(uint32_t);
+				if (word_idx >= patched_code.size()) {
+					break;
+				}
+				const auto found_inst = std::ranges::find_if(source.decoded.instructions, [pc](const auto& inst) {
+					return inst.pc == pc;
+				});
+				const uint32_t count = (found_inst != source.decoded.instructions.end() && found_inst->word_count > 0)
+				                           ? found_inst->word_count : 1u;
+				for (uint32_t w = 0; w < count && (word_idx + w) < patched_code.size(); ++w) {
+					// 0xbf800000u is GCN/RDNA2 's_nop 0' (SOPP opcode 0)
+					patched_code[word_idx + w] = 0xbf800000u;
+				}
+				source = ShaderRecompiler::PrepareShaderSource(patched_code, options);
+			}
+		}
+	}
+	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
+	ShaderRecompiler::TranslateResult translated;
+	if (current != nullptr) {
+		if (!current->calls.empty()) {
+			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+			translated.program.source_reads = current->reads;
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+		}
+	} else {
+		translated = ShaderRecompiler::TranslateProgram(params.code, options);
+	}
+	if (entry == m_program_cache.end()) {
+		auto retained = !source.calls.empty()
+		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
+		                    : nullptr;
+		entry = m_program_cache.emplace(m_lookup_key, Program {
+		    .call_source   = std::move(retained),
+		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+		}).first;
+		auto& program = entry->second;
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+		    program.resource_plan, runtime, program.resources, program.specialization));
+	} else if (source_changed) {
+		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+			return bind(*module);
+		}
+	}
+	return bind(
